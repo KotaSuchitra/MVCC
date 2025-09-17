@@ -1,133 +1,181 @@
-// mvcc_alt.c
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <unistd.h>
 
-#define MAX_KEY_LEN 64
-#define MAX_VAL_LEN 256
-#define MAX_OPS_PER_TX 128
-#define MAX_LOGS 4096
-#define MAX_THREADS 5
+#define MAX_KEYS 16
+#define MAX_KEYNAME 16
+#define MAX_TRANSACTIONS 32
+#define MAX_WRITESET 8
 
-typedef enum { OP_SET = 1, OP_DEL = 2 } OpType;
+typedef int txid_t;
+typedef int commit_ts_t;
 
-/* Version in the MVCC chain (newest-first) */
+// ===== Versioned Value =====
 typedef struct Version {
-    char value[MAX_VAL_LEN];
-    unsigned long ts;           /* begin timestamp */
-    struct Version *next;
+    commit_ts_t commit_ts;     // commit timestamp
+    char *value;               // stored value
+    struct Version *next;      // newer -> older
 } Version;
 
-/* A key/node in the store */
-typedef struct KVNode {
-    char key[MAX_KEY_LEN];
-    Version *versions;          /* newest-first */
-    pthread_mutex_t lock;       /* protects versions list */
-    struct KVNode *next;
-} KVNode;
+// ===== Key =====
+typedef struct Key {
+    char name[MAX_KEYNAME];
+    Version *versions;         // head = newest version
+    txid_t lock_owner;         // 0 = no lock
+} Key;
 
-/* Single operation recorded in transaction */
-typedef struct Op {
-    OpType type;
-    char key[MAX_KEY_LEN];
-    char value[MAX_VAL_LEN];    /* empty for delete */
-    unsigned long apply_ts;     /* filled at commit time */
-} Op;
+// ===== Transaction =====
+typedef enum {TX_ACTIVE, TX_ABORTED, TX_COMMITTED} tx_state_t;
 
-/* Transaction container */
+typedef struct KVPair {
+    char key[MAX_KEYNAME];
+    char value[128];
+} KVPair;
+
 typedef struct Transaction {
-    int tid;
-    unsigned long start_ts;     /* snapshot timestamp */
-    Op ops[MAX_OPS_PER_TX];
-    int op_count;
+    txid_t id;
+    commit_ts_t start_ts;
+    tx_state_t state;
+    KVPair write_set[MAX_WRITESET];
+    int write_count;
 } Transaction;
 
-/* Global log entry (committed ops) */
-typedef struct LogEntry {
-    int tid;
-    OpType type;
-    char key[MAX_KEY_LEN];
-    char value[MAX_VAL_LEN];
-    unsigned long ts;
-} LogEntry;
+// ===== Global Store =====
+Key store[MAX_KEYS];
+int store_count = 0;
+commit_ts_t global_commit_ts = 1;
+txid_t global_tx_seq = 1;
+pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Globals */
-static KVNode *store = NULL;
-static pthread_mutex_t store_global_lock = PTHREAD_MUTEX_INITIALIZER;
-static LogEntry glog[MAX_LOGS];
-static int glog_index = 0;
-static pthread_mutex_t glog_lock = PTHREAD_MUTEX_INITIALIZER;
-static atomic_ulong global_ts = 1;
-static atomic_int tid_counter = 1;
-
-/* helper: find or create node (protected by store_global_lock) */
-static KVNode *get_or_create_node(const char *key) {
-    pthread_mutex_lock(&store_global_lock);
-    KVNode *cur = store;
-    while (cur) {
-        if (strcmp(cur->key, key) == 0) {
-            pthread_mutex_unlock(&store_global_lock);
-            return cur;
-        }
-        cur = cur->next;
-    }
-    KVNode *node = calloc(1, sizeof(KVNode));
-    strncpy(node->key, key, MAX_KEY_LEN-1);
-    node->versions = NULL;
-    pthread_mutex_init(&node->lock, NULL);
-    node->next = store;
-    store = node;
-    pthread_mutex_unlock(&store_global_lock);
-    return node;
+// ===== Helpers =====
+Key* create_key(const char *k, const char *initial) {
+    Key *key = &store[store_count++];
+    strncpy(key->name, k, MAX_KEYNAME-1);
+    key->lock_owner = 0;
+    Version *v = malloc(sizeof(Version));
+    v->commit_ts = 0;
+    v->value = strdup(initial);
+    v->next = NULL;
+    key->versions = v;
+    return key;
 }
 
-/* Begin a new transaction */
-Transaction *begin_tx(void) {
-    Transaction *tx = calloc(1, sizeof(Transaction));
-    tx->tid = atomic_fetch_add(&tid_counter, 1);
-    tx->start_ts = atomic_fetch_add(&global_ts, 1);
-    tx->op_count = 0;
-    printf("Transaction %d started (snapshot=%lu)\n", tx->tid, tx->start_ts);
-    return tx;
-}
-
-/* Read consistent value according to tx snapshot (no locks needed for readers beyond per-node lock) */
-char *kv_get(Transaction *tx, const char *key) {
-    KVNode *node = get_or_create_node(key);
-    pthread_mutex_lock(&node->lock);
-    Version *v = node->versions;
-    while (v) {
-        if (v->ts <= tx->start_ts) {
-            /* return a pointer to the version value (note: caller must copy if it needs it later) */
-            char *res = strdup(v->value);
-            pthread_mutex_unlock(&node->lock);
-            return res;
-        }
-        v = v->next;
+Key* get_key(const char *k) {
+    for (int i=0;i<store_count;i++) {
+        if (strcmp(store[i].name, k)==0) return &store[i];
     }
-    pthread_mutex_unlock(&node->lock);
     return NULL;
 }
 
-/* Buffer a set in the transaction (no global effect until commit) */
-int kv_set(Transaction *tx, const char *key, const char *value) {
-    if (!tx) return -1;
-    if (tx->op_count >= MAX_OPS_PER_TX) return -1;
-    Op *op = &tx->ops[tx->op_count++];
-    op->type = OP_SET;
-    strncpy(op->key, key, MAX_KEY_LEN-1);
-    strncpy(op->value, value, MAX_VAL_LEN-1);
-    op->apply_ts = 0;
-    printf("[T%d] buffered SET %s = %s\n", tx->tid, key, value);
-    return 0;
+void add_version(Key *k, commit_ts_t ts, const char *val) {
+    Version *v = malloc(sizeof(Version));
+    v->commit_ts = ts;
+    v->value = strdup(val);
+    v->next = k->versions;
+    k->versions = v;
 }
 
-/* Buffer a delete in the transaction */
-int kv_del(Transaction *tx, const char *key) {
-    if (!tx) return -1;
-    if (tx->op_count >= MAX_OPS_PER_TX) return -1;
-    Op *op = &tx*
+// ===== Transaction API =====
+Transaction* tx_begin() {
+    Transaction *tx = calloc(1,sizeof(Transaction));
+    pthread_mutex_lock(&global_lock);
+    tx->id = global_tx_seq++;
+    tx->start_ts = global_commit_ts; // snapshot timestamp
+    pthread_mutex_unlock(&global_lock);
+    tx->state = TX_ACTIVE;
+    printf("[TX %d] BEGIN (snapshot=%d)\n", tx->id, tx->start_ts);
+    return tx;
+}
+
+void tx_read(Transaction *tx, const char *keyname) {
+    Key *k = get_key(keyname);
+    if (!k) { printf("[TX %d] READ %s -> NULL\n", tx->id,keyname); return; }
+    Version *v = k->versions;
+    while (v) {
+        if (v->commit_ts <= tx->start_ts) {
+            printf("[TX %d] READ %s -> %s (as of ts=%d)\n", tx->id, keyname, v->value, v->commit_ts);
+            return;
+        }
+        v = v->next;
+    }
+    printf("[TX %d] READ %s -> NULL\n", tx->id,keyname);
+}
+
+// Explicit versioned read
+void tx_read_versioned(const char *keyname, commit_ts_t ts) {
+    Key *k = get_key(keyname);
+    if (!k) { printf("[Versioned] %s at ts=%d -> NULL\n", keyname, ts); return; }
+    Version *v = k->versions;
+    while (v) {
+        if (v->commit_ts <= ts) {
+            printf("[Versioned] %s at ts=%d -> %s (commit_ts=%d)\n", keyname, ts, v->value, v->commit_ts);
+            return;
+        }
+        v = v->next;
+    }
+    printf("[Versioned] %s at ts=%d -> NULL\n", keyname, ts);
+}
+
+void tx_write(Transaction *tx, const char *key, const char *val) {
+    strncpy(tx->write_set[tx->write_count].key,key,MAX_KEYNAME-1);
+    strncpy(tx->write_set[tx->write_count].value,val,127);
+    tx->write_count++;
+    printf("[TX %d] WRITE buffered %s=%s\n", tx->id, key,val);
+}
+
+void tx_commit(Transaction *tx) {
+    pthread_mutex_lock(&global_lock);
+    commit_ts_t new_ts = ++global_commit_ts;
+    for (int i=0;i<tx->write_count;i++) {
+        Key *k = get_key(tx->write_set[i].key);
+        if (!k) k = create_key(tx->write_set[i].key,"");
+        add_version(k,new_ts,tx->write_set[i].value);
+        printf("[TX %d] COMMIT %s=%s (ts=%d)\n", tx->id,
+               tx->write_set[i].key, tx->write_set[i].value,new_ts);
+    }
+    tx->state = TX_COMMITTED;
+    pthread_mutex_unlock(&global_lock);
+}
+
+// Print all versions of a key
+void print_versions(const char *keyname) {
+    Key *k = get_key(keyname);
+    if (!k) return;
+    printf("Versions of %s:\n", keyname);
+    Version *v = k->versions;
+    while(v) {
+        printf("  ts=%d -> %s\n", v->commit_ts, v->value);
+        v = v->next;
+    }
+}
+
+int main() {
+    create_key("A","initA");
+    create_key("B","initB");
+
+    Transaction *t1 = tx_begin();
+    tx_read(t1,"A");
+    tx_write(t1,"A","100");
+    tx_commit(t1);
+
+    Transaction *t2 = tx_begin();
+    tx_read(t2,"A");
+    tx_write(t2,"A","200");
+    tx_commit(t2);
+
+    Transaction *t3 = tx_begin();
+    tx_read(t3,"A");
+
+    printf("\n=== Versioned Reads ===\n");
+    tx_read_versioned("A",0);
+    tx_read_versioned("A",1);
+    tx_read_versioned("A",2);
+
+    printf("\n=== All Versions of A ===\n");
+    print_versions("A");
+
+    return 0;
+}
